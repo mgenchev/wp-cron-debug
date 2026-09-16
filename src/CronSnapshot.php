@@ -4,31 +4,36 @@ namespace WpCronDebug;
 
 final class CronSnapshot {
     /**
-     * Read the current cron option directly from the database.
+     * Read the current cron array without reusing the long-lived parent
+     * process option cache.
      *
-     * The interactive command is a long-lived PHP process while isolated
-     * workers can update the cron option in separate processes. Reading via
-     * get_option() / _get_cron_array() can therefore return a stale in-memory
-     * alloptions snapshot after a real-cron run.
+     * Prefer WordPress' own cron API so pre_option_cron and replacement cron
+     * storage integrations remain effective. Newer WordPress versions expose
+     * a fresh-read parameter on _get_cron_array(); older versions require
+     * invalidating the option caches before asking core for the array again.
      *
      * @return array
      */
     public static function readFresh() {
-        global $wpdb;
-
-        if ( isset( $wpdb ) && is_object( $wpdb ) && isset( $wpdb->options ) && method_exists( $wpdb, 'get_var' ) ) {
-            $table = (string) $wpdb->options;
-            if ( '' === $table || ! preg_match( '/^[A-Za-z0-9_$]+$/', $table ) ) {
-                throw new \RuntimeException( 'Unable to read cron events: invalid WordPress options table name.' );
+        if ( function_exists( '_get_cron_array' ) ) {
+            try {
+                $reflection = new \ReflectionFunction( '_get_cron_array' );
+                if ( $reflection->getNumberOfParameters() >= 1 ) {
+                    $crons = _get_cron_array( true );
+                    return is_array( $crons ) ? $crons : array();
+                }
+            } catch ( \ReflectionException $e ) {
+                // Fall through to the cache-invalidation path.
             }
 
-            $query = "SELECT option_value FROM `{$table}` WHERE option_name = 'cron' LIMIT 1";
-            $raw = $wpdb->get_var( $query );
-            if ( null === $raw || false === $raw ) {
-                return array();
-            }
+            self::invalidateOptionCache();
+            $crons = _get_cron_array();
+            return is_array( $crons ) ? $crons : array();
+        }
 
-            $crons = function_exists( 'maybe_unserialize' ) ? maybe_unserialize( $raw ) : @unserialize( $raw );
+        self::invalidateOptionCache();
+        if ( function_exists( 'get_option' ) ) {
+            $crons = get_option( 'cron', array() );
             if ( ! is_array( $crons ) ) {
                 return array();
             }
@@ -38,14 +43,18 @@ final class CronSnapshot {
             }
 
             unset( $crons['version'] );
-            return is_array( $crons ) ? $crons : array();
-        }
-
-        if ( function_exists( '_get_cron_array' ) ) {
-            $crons = _get_cron_array();
-            return is_array( $crons ) ? $crons : array();
+            return $crons;
         }
 
         return array();
+    }
+
+    private static function invalidateOptionCache() {
+        if ( ! function_exists( 'wp_cache_delete' ) ) {
+            return;
+        }
+
+        wp_cache_delete( 'cron', 'options' );
+        wp_cache_delete( 'alloptions', 'options' );
     }
 }

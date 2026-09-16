@@ -17,6 +17,7 @@ final class LogWriter {
         }
 
         $this->path = $workingDirectory . DIRECTORY_SEPARATOR . 'cron-debug.log';
+        $this->assertSafeTarget();
         if ( file_exists( $this->path ) && ! is_writable( $this->path ) ) {
             throw new \RuntimeException( 'The log file is not writable: ' . $this->path );
         }
@@ -108,8 +109,51 @@ final class LogWriter {
         $lines[] = '';
 
         $content = implode( PHP_EOL, $lines );
-        if ( false === file_put_contents( $this->path, $content, LOCK_EX ) ) {
-            throw new \RuntimeException( 'Unable to write log file: ' . $this->path );
+        $this->writeSafely( $content );
+    }
+
+    private function assertSafeTarget() {
+        if ( is_link( $this->path ) ) {
+            throw new \RuntimeException( 'Refusing to write cron-debug.log through a symbolic link.' );
+        }
+
+        if ( file_exists( $this->path ) && ! is_file( $this->path ) ) {
+            throw new \RuntimeException( 'Refusing to overwrite a non-regular cron-debug.log target.' );
+        }
+    }
+
+    private function writeSafely( $content ) {
+        $this->assertSafeTarget();
+
+        $directory = dirname( $this->path );
+        $temporary = tempnam( $directory, '.cron-debug-' );
+        if ( false === $temporary ) {
+            throw new \RuntimeException( 'Unable to create a temporary log file in: ' . $directory );
+        }
+
+        try {
+            @chmod( $temporary, 0600 );
+            if ( false === file_put_contents( $temporary, (string) $content, LOCK_EX ) ) {
+                throw new \RuntimeException( 'Unable to write temporary cron debug log.' );
+            }
+
+            $this->assertSafeTarget();
+
+            if ( '\\' === DIRECTORY_SEPARATOR && file_exists( $this->path ) ) {
+                if ( ! @unlink( $this->path ) ) {
+                    throw new \RuntimeException( 'Unable to replace log file: ' . $this->path );
+                }
+            }
+
+            if ( ! @rename( $temporary, $this->path ) ) {
+                throw new \RuntimeException( 'Unable to replace log file: ' . $this->path );
+            }
+            $temporary = '';
+            @chmod( $this->path, 0600 );
+        } finally {
+            if ( '' !== $temporary && file_exists( $temporary ) ) {
+                @unlink( $temporary );
+            }
         }
     }
 
@@ -169,7 +213,27 @@ final class LogWriter {
         $lines[] = self::SEPARATOR;
         $lines[] = '';
         $lines[] = 'Rescheduled: ' . $this->lifecycleLabel( isset( $lifecycle['rescheduled'] ) ? $lifecycle['rescheduled'] : 'unknown' );
+        if ( isset( $lifecycle['reschedule_error'] ) && is_array( $lifecycle['reschedule_error'] ) ) {
+            $lines[] = '  Error: ' . $this->formatLifecycleError( $lifecycle['reschedule_error'] );
+        }
+
         $lines[] = 'Unscheduled: ' . $this->lifecycleLabel( isset( $lifecycle['unscheduled'] ) ? $lifecycle['unscheduled'] : 'unknown' );
+        if ( isset( $lifecycle['unschedule_error'] ) && is_array( $lifecycle['unschedule_error'] ) ) {
+            $lines[] = '  Error: ' . $this->formatLifecycleError( $lifecycle['unschedule_error'] );
+        }
+    }
+
+    private function formatLifecycleError( array $error ) {
+        $code = isset( $error['code'] ) ? trim( (string) $error['code'] ) : '';
+        $message = isset( $error['message'] ) ? trim( (string) $error['message'] ) : '';
+
+        if ( '' !== $code && '' !== $message ) {
+            return $code . ' — ' . $message;
+        }
+        if ( '' !== $message ) {
+            return $message;
+        }
+        return '' !== $code ? $code : 'Unknown WordPress error';
     }
 
     private function lifecycleLabel( $status ) {

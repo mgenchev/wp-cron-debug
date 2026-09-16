@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 - 2026-09-16
+
+### Fixed
+
+- Forced fresh WP-Cron snapshots through the WordPress cron/option layer so rescheduled events are visible immediately without bypassing option filters or replacement cron storage integrations.
+- Hardened `cron-debug.log` replacement against symbolic-link and non-regular targets; replacement logs use owner-only (`0600`) permissions on Unix-like systems.
+- Preserved detailed `WP_Error` codes and messages from real-cron reschedule/unschedule operations when supported by the installed WordPress version.
+
 ## 0.1.0 - 2026-09-16
 
 ### Added
@@ -21,15 +29,12 @@
 
 ### Changed
 
-- Profile query details are labeled `QUERIES BY DURATION` rather than implying an absolute slow-query threshold.
+- Profile query details are labeled `TOP 10 QUERIES BY DURATION`, making the ranking explicit without implying an absolute slow-query threshold.
 - Added extra spacing between profile query numbers and timings for easier scanning.
-- Reformatted the `PROFILE` log section into a compact `SUMMARY` block and separate numbered `QUERIES BY DURATION` blocks with aligned caller/query labels.
+- Reformatted the `PROFILE` log section into a compact `SUMMARY` block and separate numbered `TOP 10 QUERIES BY DURATION` blocks with aligned caller/query labels.
 - Simplified log section formatting: each heading has a single separator below it, and `RESULT` appears immediately after the main `WP CRON DEBUG` metadata section.
 - Real-cron execution does not ask for an extra confirmation and returns directly to a freshly loaded event list after completion.
 - Removed duration from console run summaries; duration remains available in `cron-debug.log`.
 - Captured stdout is preserved exactly as emitted by the callback; no automatic `<pre>` removal or `var_dump()` string compaction is applied.
 - Callbacks that invoke `exit`/`die` are reported as `EXITED` instead of the ambiguous `TERMINATED` status.
 
-### Fixed
-
-- Fixed stale event lists after `Run as real cron` by reading the current cron option directly from the database instead of reusing the long-lived parent process option cache.

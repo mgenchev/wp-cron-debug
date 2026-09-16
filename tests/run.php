@@ -43,24 +43,21 @@ if ( ! defined( 'WPMU_PLUGIN_DIR' ) ) {
 
 $GLOBALS['test_crons'] = array();
 
-$GLOBALS['test_db_crons_override'] = null;
+$GLOBALS['test_fresh_crons_override'] = null;
+$GLOBALS['test_cache_delete_calls'] = array();
+$GLOBALS['test_reschedule_result'] = true;
+$GLOBALS['test_unschedule_result'] = true;
 
-final class TestWpdb {
-    public $options = 'wp_options';
-
-    public function get_var( $query ) {
-        $crons = is_array( $GLOBALS['test_db_crons_override'] ) ? $GLOBALS['test_db_crons_override'] : $GLOBALS['test_crons'];
-        return serialize( $crons );
-    }
-}
-
-$GLOBALS['wpdb'] = new TestWpdb();
 $GLOBALS['test_scheduled_event_exists'] = true;
 $GLOBALS['test_action_callback'] = null;
 $GLOBALS['test_lifecycle_calls'] = array();
 $GLOBALS['wp_filter'] = array();
 
 function wp_cache_delete( $key, $group = '' ) {
+    $GLOBALS['test_cache_delete_calls'][] = array( (string) $key, (string) $group );
+    if ( 'alloptions' === $key && 'options' === $group && is_array( $GLOBALS['test_fresh_crons_override'] ) ) {
+        $GLOBALS['test_crons'] = $GLOBALS['test_fresh_crons_override'];
+    }
     return true;
 }
 
@@ -97,18 +94,36 @@ function wp_get_schedules() {
     );
 }
 
-function wp_reschedule_event( $timestamp, $recurrence, $hook, $args = array() ) {
-    $GLOBALS['test_lifecycle_calls'][] = array( 'reschedule', (int) $timestamp, (string) $recurrence, (string) $hook, $args );
-    return true;
+final class TestWpError {
+    private $code;
+    private $message;
+
+    public function __construct( $code, $message ) {
+        $this->code = (string) $code;
+        $this->message = (string) $message;
+    }
+
+    public function get_error_code() {
+        return $this->code;
+    }
+
+    public function get_error_message() {
+        return $this->message;
+    }
 }
 
-function wp_unschedule_event( $timestamp, $hook, $args = array() ) {
-    $GLOBALS['test_lifecycle_calls'][] = array( 'unschedule', (int) $timestamp, (string) $hook, $args );
-    return true;
+function wp_reschedule_event( $timestamp, $recurrence, $hook, $args = array(), $wp_error = false ) {
+    $GLOBALS['test_lifecycle_calls'][] = array( 'reschedule', (int) $timestamp, (string) $recurrence, (string) $hook, $args, (bool) $wp_error );
+    return $GLOBALS['test_reschedule_result'];
+}
+
+function wp_unschedule_event( $timestamp, $hook, $args = array(), $wp_error = false ) {
+    $GLOBALS['test_lifecycle_calls'][] = array( 'unschedule', (int) $timestamp, (string) $hook, $args, (bool) $wp_error );
+    return $GLOBALS['test_unschedule_result'];
 }
 
 function is_wp_error( $value ) {
-    return false;
+    return $value instanceof TestWpError;
 }
 
 function do_action_ref_array( $hook, $args ) {
@@ -212,7 +227,7 @@ $GLOBALS['test_crons'] = array(
         ),
     ),
 );
-$GLOBALS['test_db_crons_override'] = array(
+$GLOBALS['test_fresh_crons_override'] = array(
     3700 => array(
         'sample_hook' => array(
             $oldSignature => array( 'schedule' => 'hourly', 'args' => array( 1 ), 'interval' => 3600 ),
@@ -221,10 +236,14 @@ $GLOBALS['test_db_crons_override'] = array(
 );
 $freshGroups = $repository->allGroupedByCategory();
 $freshEvents = $freshGroups[ SourceClassifier::OTHER ]['sample_hook'];
-assert_same( 3700, $freshEvents[0]['timestamp'], 'Event list refresh reads the current cron snapshot directly from the database after a real-cron reschedule.' );
+assert_same( 3700, $freshEvents[0]['timestamp'], 'Event list refresh invalidates the parent option cache and reads the current cron snapshot through WordPress.' );
+assert_true( in_array( array( 'alloptions', 'options' ), $GLOBALS['test_cache_delete_calls'], true ), 'Fresh cron snapshots invalidate the alloptions cache on WordPress versions without native fresh-read support.' );
 assert_true( ! EventMatcher::exists( 'sample_hook', array( 1 ), 100 ), 'Exact matcher rejects the stale pre-reschedule event even when the parent process still has an old cron snapshot.' );
-assert_true( EventMatcher::exists( 'sample_hook', array( 1 ), 3700 ), 'Exact matcher accepts the freshly rescheduled event from the database snapshot.' );
-$GLOBALS['test_db_crons_override'] = null;
+assert_true( EventMatcher::exists( 'sample_hook', array( 1 ), 3700 ), 'Exact matcher accepts the freshly rescheduled event from the WordPress cron snapshot.' );
+$GLOBALS['test_fresh_crons_override'] = null;
+$GLOBALS['test_cache_delete_calls'] = array();
+$GLOBALS['test_reschedule_result'] = true;
+$GLOBALS['test_unschedule_result'] = true;
 
 
 // Log preserves developer output exactly, including HTML wrappers and long var_dump strings.
@@ -251,6 +270,28 @@ assert_true( 0 === strpos( $rawLog, 'WP CRON DEBUG' . PHP_EOL . '---------------
 assert_true( strpos( $rawLog, 'RESULT' ) < strpos( $rawLog, 'OUTPUT' ), 'RESULT appears directly after the main metadata section and before OUTPUT.' );
 assert_true( false === strpos( $rawLog, '--------------------------------------------------------------------' . PHP_EOL . 'RESULT' ), 'RESULT has no separator above its heading.' );
 assert_true( false === strpos( $rawLog, '--------------------------------------------------------------------' . PHP_EOL . 'OUTPUT' ), 'OUTPUT has no separator above its heading.' );
+
+// Security regression: cron-debug.log must never follow a symbolic link.
+if ( function_exists( 'symlink' ) && '\\' !== DIRECTORY_SEPARATOR ) {
+    $tmpSymlink = sys_get_temp_dir() . '/wp-cron-debug-symlink-test-' . uniqid( '', true );
+    mkdir( $tmpSymlink );
+    $protectedTarget = $tmpSymlink . '/protected.txt';
+    file_put_contents( $protectedTarget, 'do-not-overwrite' );
+    $linkPath = $tmpSymlink . '/cron-debug.log';
+    if ( @symlink( $protectedTarget, $linkPath ) ) {
+        $rejectedSymlink = false;
+        try {
+            new LogWriter( $tmpSymlink );
+        } catch ( RuntimeException $e ) {
+            $rejectedSymlink = false !== strpos( $e->getMessage(), 'symbolic link' );
+        }
+        assert_true( $rejectedSymlink, 'Log writer rejects a symbolic-link cron-debug.log target.' );
+        assert_same( 'do-not-overwrite', file_get_contents( $protectedTarget ), 'Rejected log symlink does not modify its target.' );
+        @unlink( $linkPath );
+    }
+    @unlink( $protectedTarget );
+    @rmdir( $tmpSymlink );
+}
 unlink( $rawWriter->getPath() );
 rmdir( $tmpRaw );
 
@@ -278,6 +319,9 @@ assert_true( false === strpos( $log, 'first output' ), 'Second run removes previ
 assert_true( false !== strpos( $log, 'second_hook' ), 'Second run writes current hook.' );
 assert_true( false !== strpos( $log, 'second output' ), 'Second run writes current output.' );
 assert_same( $tmp . DIRECTORY_SEPARATOR . 'cron-debug.log', $writer->getPath(), 'Log path is exactly cron-debug.log in the command working directory.' );
+if ( '\\' !== DIRECTORY_SEPARATOR ) {
+    assert_same( 0600, fileperms( $writer->getPath() ) & 0777, 'cron-debug.log is written with owner-only permissions.' );
+}
 unlink( $writer->getPath() );
 rmdir( $tmp );
 
@@ -656,6 +700,28 @@ assert_same( 'unschedule', $GLOBALS['test_lifecycle_calls'][1][0], 'Real cron mo
 assert_same( 'callback', $GLOBALS['test_lifecycle_calls'][2][0], 'Real cron mode executes the callback after schedule lifecycle operations.' );
 assert_same( 'success', $workerMeta['lifecycle']['rescheduled'], 'Worker records successful reschedule operation.' );
 assert_same( 'success', $workerMeta['lifecycle']['unscheduled'], 'Worker records successful unschedule operation.' );
+
+// Real cron lifecycle requests and preserves WP_Error details when the core API supports them.
+$GLOBALS['test_reschedule_result'] = new TestWpError( 'blocked_reschedule', 'A plugin blocked rescheduling.' );
+$GLOBALS['test_unschedule_result'] = new TestWpError( 'blocked_unschedule', 'A plugin blocked unscheduling.' );
+$GLOBALS['test_lifecycle_calls'] = array();
+file_put_contents( $requestFile, json_encode( array(
+    'mode' => 'real',
+    'event' => array( 'hook' => 'real_hook', 'timestamp' => 555, 'args' => array( 'x' ), 'schedule' => 'hourly', 'interval' => 3600 ),
+) ) );
+file_put_contents( $resultFile, '' );
+$worker = new Worker( $requestFile, $resultFile );
+$worker->run();
+$errorMeta = json_decode( file_get_contents( $resultFile ), true );
+assert_same( 'error', $errorMeta['lifecycle']['rescheduled'], 'Worker records a reschedule WP_Error as an error lifecycle status.' );
+assert_same( 'blocked_reschedule', $errorMeta['lifecycle']['reschedule_error']['code'], 'Worker preserves the reschedule WP_Error code.' );
+assert_same( 'A plugin blocked rescheduling.', $errorMeta['lifecycle']['reschedule_error']['message'], 'Worker preserves the reschedule WP_Error message.' );
+assert_same( 'error', $errorMeta['lifecycle']['unscheduled'], 'Worker records an unschedule WP_Error as an error lifecycle status.' );
+assert_same( 'blocked_unschedule', $errorMeta['lifecycle']['unschedule_error']['code'], 'Worker preserves the unschedule WP_Error code.' );
+assert_true( ! empty( $GLOBALS['test_lifecycle_calls'][0][5] ), 'Worker requests WP_Error details from wp_reschedule_event() when supported.' );
+assert_true( ! empty( $GLOBALS['test_lifecycle_calls'][1][4] ), 'Worker requests WP_Error details from wp_unschedule_event() when supported.' );
+$GLOBALS['test_reschedule_result'] = true;
+$GLOBALS['test_unschedule_result'] = true;
 unlink( $requestFile );
 unlink( $resultFile );
 
@@ -678,6 +744,16 @@ assert_true( false !== strpos( $realLog, 'Real cron lifecycle / schedule updated
 assert_true( false !== strpos( $realLog, 'CRON LIFECYCLE' ), 'Real cron log includes lifecycle results.' );
 assert_true( false !== strpos( $realLog, 'Rescheduled: yes' ), 'Real cron log records reschedule result.' );
 assert_true( false === strpos( $realLog, '--------------------------------------------------------------------' . PHP_EOL . 'CRON LIFECYCLE' ), 'CRON LIFECYCLE has no separator above its heading.' );
+$realMeta['lifecycle'] = array(
+    'rescheduled' => 'error',
+    'reschedule_error' => array( 'code' => 'blocked_reschedule', 'message' => 'A plugin blocked rescheduling.' ),
+    'unscheduled' => 'error',
+    'unschedule_error' => array( 'code' => 'blocked_unschedule', 'message' => 'A plugin blocked unscheduling.' ),
+);
+$realWriter->write( $profileEvent, $profileResult, $realMeta );
+$realErrorLog = file_get_contents( $realWriter->getPath() );
+assert_true( false !== strpos( $realErrorLog, 'Error: blocked_reschedule — A plugin blocked rescheduling.' ), 'Real cron log includes the reschedule WP_Error details.' );
+assert_true( false !== strpos( $realErrorLog, 'Error: blocked_unschedule — A plugin blocked unscheduling.' ), 'Real cron log includes the unschedule WP_Error details.' );
 unlink( $realWriter->getPath() );
 rmdir( $tmpReal );
 

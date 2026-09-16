@@ -179,7 +179,7 @@ This mode applies the selected event's WordPress schedule lifecycle before execu
 2. the selected current instance is unscheduled;
 3. the callback is executed with the exact event arguments.
 
-This intentionally changes the cron schedule. It runs immediately after selection without an extra confirmation prompt. After the run, the cron registry is refreshed from a fresh database snapshot and the interface returns directly to the relevant event list instead of offering `Run again` for an event instance that has already been moved or removed. The log records whether the reschedule and unschedule operations succeeded.
+This intentionally changes the cron schedule. It runs immediately after selection without an extra confirmation prompt. After the run, the cron registry is refreshed through a fresh WordPress cron snapshot and the interface returns directly to the relevant event list instead of offering `Run again` for an event instance that has already been moved or removed. The refresh avoids stale parent-process option caches while preserving WordPress cron/option filters. The log records whether the reschedule and unschedule operations succeeded and, when supported by WordPress, includes the `WP_Error` code/message for lifecycle failures.
 
 This mode reproduces the event-level schedule lifecycle used by WordPress cron. It does **not** emulate the full `wp-cron.php` process-level lock, spawn request, or loop over all currently due events.
 
@@ -201,7 +201,7 @@ A callback that explicitly calls `exit` or `die` is reported as `EXITED`, rather
 
 Captured output is bounded to 10 MB per run. Additional output is discarded and the log is marked as truncated.
 
-Because arbitrary debug output may contain secrets or personal data, treat `cron-debug.log` as sensitive developer output and do not commit it.
+Because arbitrary debug output may contain secrets or personal data, treat `cron-debug.log` as sensitive developer output and do not commit it. The package refuses to write through a symbolic-link/non-regular `cron-debug.log` target. On Unix-like systems replacement logs are written with owner-only (`0600`) permissions.
 
 ## Event categories
 
@@ -216,7 +216,7 @@ The package does not classify events by hook-name heuristics or hard-coded plugi
 
 ## Safety boundaries
 
-Normal debug and profile runs do not modify the cron schedule. Schedule changes are isolated behind the explicit `Run as real cron` action. Real-cron execution returns to a freshly loaded event list after the run. Cron discovery and exact-event revalidation bypass the long-lived parent process option cache so rescheduled timestamps are visible immediately.
+Normal debug and profile runs do not modify the cron schedule. Schedule changes are isolated behind the explicit `Run as real cron` action. Real-cron execution returns to a freshly loaded event list after the run. Cron discovery and exact-event revalidation force a fresh WordPress cron snapshot so rescheduled timestamps are visible immediately without bypassing WordPress option filters or replacement cron storage integrations.
 
 The package does not provide generic cron deletion/editing controls or automatically repair diagnostics findings.
 
@@ -224,7 +224,7 @@ The selected event is identified by hook, timestamp, and exact argument array. T
 
 ## Current limitations
 
-- Action Scheduler is intentionally out of scope for this WP-Cron-focused build and can be added as a separate job-engine layer later.
+- Action Scheduler is intentionally out of scope. It belongs in a separate developer package so this command remains focused on WP-Cron semantics.
 - Source classification can report `Other` for unusual callback loaders or path layouts that cannot be proven to belong to core/plugins/theme.
 - PHP/bootstrap output produced before the debug callback begins may also appear in the captured child-process output, which is useful when debugging load-time problems.
 

@@ -192,14 +192,50 @@ final class Worker {
                 throw new \RuntimeException( 'wp_reschedule_event() is unavailable.' );
             }
 
-            $rescheduled = wp_reschedule_event( (int) $event['timestamp'], (string) $schedule, $event['hook'], $event['args'] );
+            $rescheduled = $this->callCronFunction(
+                'wp_reschedule_event',
+                array( (int) $event['timestamp'], (string) $schedule, $event['hook'], $event['args'] ),
+                5
+            );
             $this->lifecycle['rescheduled'] = $this->normalizeLifecycleResult( $rescheduled );
+            $this->captureLifecycleError( 'reschedule_error', $rescheduled );
         } else {
             $this->lifecycle['rescheduled'] = 'not_applicable';
         }
 
-        $unscheduled = wp_unschedule_event( (int) $event['timestamp'], $event['hook'], $event['args'] );
+        $unscheduled = $this->callCronFunction(
+            'wp_unschedule_event',
+            array( (int) $event['timestamp'], $event['hook'], $event['args'] ),
+            4
+        );
         $this->lifecycle['unscheduled'] = $this->normalizeLifecycleResult( $unscheduled );
+        $this->captureLifecycleError( 'unschedule_error', $unscheduled );
+    }
+
+    private function callCronFunction( $function, array $args, $wpErrorParameterCount ) {
+        try {
+            $reflection = new \ReflectionFunction( $function );
+            if ( $reflection->getNumberOfParameters() >= (int) $wpErrorParameterCount ) {
+                $args[] = true;
+            }
+        } catch ( \ReflectionException $e ) {
+            // Use the legacy boolean-return signature.
+        }
+
+        return call_user_func_array( $function, $args );
+    }
+
+    private function captureLifecycleError( $key, $result ) {
+        if ( ! function_exists( 'is_wp_error' ) || ! is_wp_error( $result ) ) {
+            return;
+        }
+
+        $code = method_exists( $result, 'get_error_code' ) ? (string) $result->get_error_code() : '';
+        $message = method_exists( $result, 'get_error_message' ) ? (string) $result->get_error_message() : '';
+        $this->lifecycle[ $key ] = array(
+            'code' => $code,
+            'message' => $message,
+        );
     }
 
     private function normalizeLifecycleResult( $result ) {
